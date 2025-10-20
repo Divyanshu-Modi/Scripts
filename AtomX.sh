@@ -17,14 +17,15 @@ KERNEL_DIR=$(pwd)
 PRO_PATH="$KERNEL_DIR/.."
 
 # Toolchain Directory
-TLDR="$PRO_PATH/toolchains"
+TLDR="$PRO_PATH/toolchain"
+PYTHON3=$(which python3)
 
 # Anykernel Directories
 AK3_DIR="$PRO_PATH/AnyKernel3"
 AKVDR="$AK3_DIR/modules/vendor/lib/modules"
 
-# Device Tree Blob Directory
-DTB_PATH="$KERNEL_DIR/work/arch/arm64/boot/dts/vendor/qcom"
+# device tree blob install path
+DTB_PATH="${KERNEL_DIR}/work/dtbs/vendor/qcom"
 
 ############################################################################
 
@@ -48,14 +49,6 @@ error()
 	exit 1
 }
 
-success()
-{
-	echo -e ""
-	echo -e "$G ${FUNCNAME[1]}: $W" "$@"
-	echo -e ""
-	exit 0
-}
-
 inform()
 {
 	echo -e ""
@@ -63,16 +56,21 @@ inform()
 	echo -e ""
 }
 
-muke()
+success()
+{
+	inform $@
+	exit 0
+}
+
+amake()
 {
 	if [[ -z $COMPILER || -z $COMPILER32 ]]; then
-		error "Compiler is missing"
+		COMPILER=clang
+		COMPILER32=clang
+		compiler_setup
 	fi
-	if [[ $LOG != 1 ]]; then
-		make "${MAKE_ARGS[@]}" "$@"
-	else
-		make "$@" "${MAKE_ARGS[@]}" 2>&1 | tee log.txt
-	fi
+
+	make "${MAKE_ARGS[@]}" "$@"
 }
 
 usage()
@@ -110,7 +108,7 @@ compiler_setup()
 	LLVM_PATH="$C_PATH/bin"
 	C_NAME=$("$LLVM_PATH"/$CC --version | head -n 1 | perl -pe 's/\(http.*?\)//gs')
 	C_NAME_32="$C_NAME"
-	MAKE_ARGS=("CROSS_COMPILE_COMPAT=arm-linux-gnueabi-")
+	MAKE_ARGS+=("CROSS_COMPILE_COMPAT=arm-linux-gnueabi-")
 
 	if [[ "$COMPILER32" == "gcc" ]]; then
 		MAKE_ARGS=("CC_COMPAT=$TLDR/gcc-arm/bin/arm-eabi-gcc"
@@ -120,7 +118,6 @@ compiler_setup()
 
 	MAKE_ARGS+=("O=work"
 		"ARCH=arm64"
-		"DTC_EXT=$(which dtc)"
 		"LLVM=1"
 		"LLVM_IAS=1"
 		"-j"$CORES""
@@ -140,15 +137,14 @@ config_generator()
 	#########################  .config GENERATOR  ############################
 	if [[ -z $CODENAME ]]; then
 		error 'Codename not present connot proceed'
-		exit 1
-	fi
-	if [[ -z $BASE ]]; then
-		DFCF="vendor/${CODENAME}-${SUFFIX}_defconfig"
-	else
-		DFCF="vendor/${BASE}-${SUFFIX}_defconfig"
 	fi
 
-	if [[ ! -f arch/arm64/configs/$DFCF ]]; then
+	DFCF="${CODENAME}-${SUFFIX}_defconfig"
+	if [[ ! -z $BASE ]]; then
+		DFCF="${BASE}-${SUFFIX}_defconfig"
+	fi
+
+	if [[ ! -f arch/arm64/configs/vendor/$DFCF ]]; then
 		# cleanup work dir as no builds
 		rm -rf work
 
@@ -156,15 +152,10 @@ config_generator()
 
 		export "${MAKE_ARGS[@]}" "TARGET_BUILD_VARIANT=user"
 
-		if [[ -z $BASE ]]; then
-			bash scripts/gki/generate_defconfig.sh "${CODENAME}-${SUFFIX}_defconfig"
-			muke $DFCF vendor/lahaina_QGKI.config savedefconfig
-		else
-			bash scripts/gki/generate_defconfig.sh "${BASE}-${SUFFIX}_defconfig"
-		fi
-		muke $DFCF vendor/lahaina_QGKI.config savedefconfig
-		rm -rf arch/arm64/configs/$DFCF
-		mv work/defconfig arch/arm64/configs/$DFCF
+		bash scripts/gki/generate_defconfig.sh "$DFCF"
+		amake vendor/$DFCF vendor/lahaina_QGKI.config savedefconfig
+		rm -rf arch/arm64/configs/vendor/$DFCF
+		mv work/defconfig arch/arm64/configs/vendor/$DFCF
 
 		# cleanup work dir as no builds
 		rm -rf work
@@ -172,10 +163,9 @@ config_generator()
 	inform "Generating .config"
 
 	# Make .config
-	muke "$DFCF"
-
-	if [[ ! -z $BASE ]] && [[ $GENERATE != 1 ]]; then
-		muke "$DFCF" "vendor/${CODENAME}-fragment.config"
+	amake "vendor/$DFCF"
+	if [[ ! -z $BASE ]]; then
+		amake "vendor/$DFCF" "vendor/${CODENAME}-fragment.config"
 	fi
 
 	############################################################################
@@ -184,13 +174,18 @@ config_generator()
 config_regenerator()
 {
 	########################  DEFCONFIG REGENERATOR  ###########################
-	config_generator
+	if [[ -z $CODENAME ]]; then
+		error 'Codename not present connot proceed'
+	fi
 
-	inform "Regenerating defconfig"
+	MAKE_ARGS+=("-s")
+	DFCF="${CODENAME}-${SUFFIX}_defconfig"
+	if [[ ! -z $BASE ]]; then
+		DFCF="${BASE}-${SUFFIX}_defconfig"
+	fi
+	amake "vendor/$DFCF" savedefconfig
 
-	muke savedefconfig
-
-	cat work/defconfig >arch/arm64/configs/"$DFCF"
+	cat work/defconfig > arch/arm64/configs/vendor/"$DFCF"
 
 	success "Regeneration completed"
 	############################################################################
@@ -199,38 +194,100 @@ config_regenerator()
 obj_builder()
 {
 	##############################  OBJ BUILD  #################################
-	if [[ $OBJ == "" ]]; then
+	if [[ -z $OBJ ]]; then
 		error "obj not defined"
 	fi
-
-	config_generator
+	if [[ ! -d work/ ]]; then
+		config_generator
+	fi
 
 	inform "Building $OBJ"
-	muke "$OBJ"
-	if [[ "$DTB_ZIP" != "1" ]]; then
-		exit 0
+	amake olddefconfig "$OBJ"
+	success "built $OBJ"
+	############################################################################
+}
+
+emod_builder()
+{
+	##############################  EMOD BUILD  #################################
+	if [[ -z $EMOD_PATH ]]; then
+		error "obj not defined"
 	fi
+	if [[ ! -d work/ ]]; then
+		error "External modules not possible without full kernel build"
+	fi
+
+	MAKE_ARGS+=("olddefconfig"
+				"-C $KERNEL_DIR" 
+				"M=$EMOD_PATH"
+				"MODNAME=$EMOD_NAME"
+				"$EMOD_ROOT=$EMOD_PATH")
+
+	if [[ $BUILD == "clean" ]]; then
+		inform "Cleaning $EMOD_PATH"
+		MAKE_ARGS+=("clean")
+	fi
+
+	inform "Building $EMOD_PATH"
+	amake
+	success "EMOD: $EMOD_NAME built successfully"
+	############################################################################
+}
+
+dtb_build()
+{
+	##############################  DTB BUILD  #################################
+	if [[ ! -d work/ ]]; then
+		config_generator
+	fi
+
+	MAKE_ARGS+=("olddefconfig"
+				"dtbs"
+				"INSTALL_DTBS_PATH="dtbs""
+				"DTB_TYPES=${PLATFORM}-overlays-"
+				"dtbs_install")
+
+	amake
+	${PYTHON3} ${TLDR}/mkdtboimg.py create ${DTB_PATH}/dtbo.img --page_size=4096 ${DTB_PATH}/*.dtbo
+
+	inform "dtbs and dtbo.img built for board: ${PLATFORM}"
 	############################################################################
 }
 
 dtb_zip()
 {
 	##############################  DTB BUILD  #################################
-	obj_builder
-	source work/.config
+	dtb_build
+
 	if [[ ! -d $AK3_DIR ]]; then
 		error 'Anykernel not present cannot zip'
 	fi
 	if [[ ! -d "$KERNEL_DIR/out" ]]; then
 		mkdir "$KERNEL_DIR"/out
 	fi
-	cp "$DTB_PATH"/*.dtb "$AK3_DIR"/dtb
-	cp "$DTB_PATH"/*.img "$AK3_DIR"/
+
+	LAST_HASH=$(git rev-parse --short=8 HEAD)
+	VERSION=$(scripts/config --file work/.config -s LOCALVERSION)
+
+	# Making sure everything is ok before making zip
 	cd "$AK3_DIR" || exit
-	make zip VERSION="$(echo "$CONFIG_LOCALVERSION" | cut -c 8-)-dtbs-only"
-	cp ./*-signed.zip "$KERNEL_DIR"/out
 	make clean
+
+	cp $DTB_PATH/${PLATFORM}.dtb "$AK3_DIR"/dtb
+	cp $DTB_PATH/dtbo.img "$AK3_DIR"/dtbo.img
+
+	MAKE_ARGS=("CODENAME=$CODENAME"
+				"VERSION="
+				"CUSTOM=dtb-$LAST_HASH")
+
+	make zip ${MAKE_ARGS[@]}
+
+	cp ./*-signed.zip "$KERNEL_DIR"/out
+
+	make clean
+
 	cd "$KERNEL_DIR" || exit
+
 	success "dtbs zip built"
 	############################################################################
 }
@@ -238,19 +295,22 @@ dtb_zip()
 kernel_builder()
 {
 	##################################  BUILD  #################################
-	if [[ "$BUILD" == "clean" ]]; then
-		inform "Cleaning work directory, please wait...."
-		muke -s clean mrproper distclean
-	fi
-
-	config_generator
-
 	# Build Start
 	BUILD_START=$(date +"%s")
 
-	source work/.config
-	MOD_NAME="$(muke kernelrelease -s)"
+	if [[ "$BUILD" == "clean" ]]; then
+		inform "Cleaning work directory, please wait...."
+		amake -s clean mrproper distclean
+	fi
+	if [[ "$BUILD" == "incremental" ]]; then
+		amake olddefconfig
+	else
+		config_generator
+	fi
+
+	MOD_NAME="$(amake kernelrelease -s)"
 	KERNEL_VERSION=$(echo "$MOD_NAME" | cut -c -7)
+	MODULES=$(scripts/config --file work/.config -s MODULES)
 
 	inform "
 	*************Build Triggered*************
@@ -258,30 +318,33 @@ kernel_builder()
 	Linux Version: $KERNEL_VERSION
 	Kernel Name: $MOD_NAME
 	Device: $DEVICENAME
+	Board: $PLATFORM
 	Codename: $CODENAME
 	Compiler: $C_NAME
 	Compiler_32: $C_NAME_32
 	"
 
 	# Compile
-	muke
-	if [[ $CONFIG_MODULES == "y" ]]; then
-		muke 'modules_install' INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="modules"
+	amake
+	amake INSTALL_DTBS_PATH="dtbs" DTB_TYPES="${PLATFORM}-overlays-" dtbs_install
+	${PYTHON3} ${TLDR}/mkdtboimg.py create ${DTB_PATH}/dtbo.img --page_size=4096 ${DTB_PATH}/*.dtbo
+	if [[ $MODULES == "y" ]]; then
+		amake 'modules_install' INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH="modules"
 	fi
 
-	# Build End
-	BUILD_END=$(date +"%s")
-
-	DIFF=$(("$BUILD_END" - "$BUILD_START"))
-
 	zipper
+
+	# Build End
+	DIFF=$(("$(date +"%s")" - "$BUILD_START"))
+
+	success "build completed in $((DIFF / 60)).$((DIFF % 60)) mins"
 	############################################################################
 }
 
 zipper()
 {
 	####################################  ZIP  #################################
-	TARGET="$(muke image_name -s)"
+	local TARGET="$(amake image_name -s)"
 
 	if [[ ! -f $KERNEL_DIR/work/$TARGET ]]; then
 		error 'Kernel image not found'
@@ -299,9 +362,10 @@ zipper()
 	cd "$KERNEL_DIR" || exit
 
 	cp "$KERNEL_DIR"/work/"$TARGET" "$AK3_DIR"
-	cp "$DTB_PATH"/*.dtb "$AK3_DIR"/dtb
-	cp "$DTB_PATH"/*.img "$AK3_DIR"/
-	if [[ $CONFIG_MODULES == "y" ]]; then
+	cp $DTB_PATH/${PLATFORM}.dtb "$AK3_DIR"/dtb
+	cp $DTB_PATH/dtbo.img "$AK3_DIR"/dtbo.img
+
+	if [[ $MODULES == "y" ]]; then
 		MOD_PATH="work/modules/lib/modules/$MOD_NAME"
 		sed -i 's/\(kernel\/[^: ]*\/\)\([^: ]*\.ko\)/\/vendor\/lib\/modules\/\2/g' "$MOD_PATH"/modules.dep
 		sed -i 's/.*\///g' "$MOD_PATH"/modules.order
@@ -311,29 +375,22 @@ zipper()
 	fi
 
 	LAST_COMMIT=$(git show -s --format=%s)
-	LAST_HASH=$(git rev-parse --short HEAD)
+	LAST_HASH=$(git rev-parse --short=8 HEAD)
+	VERSION=$(scripts/config --file work/.config -s LOCALVERSION)
+	LTO=$(scripts/config --file work/.config -s LTO_CLANG)
 
 	cd "$AK3_DIR" || exit
 
-	make zip CODENAME=$CODENAME VERSION="$(echo "$CONFIG_LOCALVERSION" | cut -c 8-)"
+	MAKE_ARGS+=("CODENAME=$CODENAME"
+				"VERSION=")
 
-	inform "
-	*************AtomX-Kernel*************
-	Linux Version: $KERNEL_VERSION
-	CI: $KBUILD_HOST
-	Core count: $CORES
-	Compiler: $C_NAME
-	Compiler_32: $C_NAME_32
-	Device: $DEVICENAME
-	Codename: $CODENAME
-	Build Date: $(date +"%Y-%m-%d %H:%M")
-	Build Type: $BUILD_TYPE
+	if [[ $LTO == "y" ]]; then
+		MAKE_ARGS+=("CUSTOM=$LAST_HASH-lto")
+	else
+		MAKE_ARGS+=("CUSTOM=$LAST_HASH")
+	fi
 
-	-----------last commit details-----------
-	Last commit (name): $LAST_COMMIT
-
-	Last commit (hash): $LAST_HASH
-	"
+	make zip ${MAKE_ARGS[@]}
 
 	cp ./*-signed.zip "$KERNEL_DIR"/out
 
@@ -341,78 +398,109 @@ zipper()
 
 	cd "$KERNEL_DIR" || exit
 
-	success "build completed in $((DIFF / 60)).$((DIFF % 60)) mins"
+	inform "
+	*************AtomX-Kernel*************
+	Linux Version: $KERNEL_VERSION
+	Kernel Name: $MOD_NAME
+	Device: $DEVICENAME
+	Platform: $PLATFORM
+	Codename: $CODENAME
+	Compiler: $C_NAME
+	Compiler_32: $C_NAME_32
+	Build Date: $(date +"%Y-%m-%d %H:%M")
 
+	-----------last commit details-----------
+	Last: $LAST_COMMIT ($LAST_HASH)
+	"
 	############################################################################
 }
 
 ###############################  COMMAND_MODE  ##############################
-if [[ -z $* ]]; then
+if [[ -z $@ ]]; then
 	usage
-fi
-if [[ "$*" =~ "--log" ]]; then
-	LOG=1
-fi
-if [[ "$*" =~ "--silence" ]]; then
-	MAKE_ARGS+=("-s")
 fi
 for arg in "$@"; do
 	case "${arg}" in
+		"--clean")
+			BUILD='clean'
+			;;
+		"--incremental")
+			BUILD='incremental'
+			;;
+		# "--log")
+		# 	MAKE_ARGS+=("2>&1 | tee log.txt")
+		# 	;;
+		"--silence")
+			MAKE_ARGS+=("-s")
+			;;
+	esac
+done
+for arg in "$@"; do
+	case "${arg}" in
+		"--clean" | "--incremental" | "--log" | "--silence")
+			;;
 		"--compiler="*)
 			COMPILER=${arg#*=}
 			COMPILER=${COMPILER,,}
-			if [[ -z "$COMPILER" ]]; then
-				usage
-				break
-			fi
 			;&
 		"--compiler32="*)
 			COMPILER32=${arg#*=}
 			COMPILER32=${COMPILER32,,}
-			if [[ -z "$COMPILER32" ]]; then
-				COMPILER32="clang"
-			fi
 			compiler_setup
 			;;
 		"--device="*)
-			CODE_NAME=${arg#*=}
-			case $CODE_NAME in
+			CODENAME=${arg#*=}
+			case $CODENAME in
 				lisa)
 					DEVICENAME='Xiaomi 11 lite 5G NE'
 					CODENAME='lisa'
 					BASE='xiaomi'
 					SUFFIX='qgki'
-					TARGET='Image'
+					PLATFORM='yupik'
 					;;
 				redwood)
 					DEVICENAME='Poco X5 Pro 5G'
 					CODENAME='redwood'
 					BASE='xiaomi'
 					SUFFIX='qgki'
-					TARGET='Image'
+					PLATFORM='yupik'
+					;;
+				lahaina)
+					DEVICENAME='Lahaina QGKI'
+					CODENAME='lahaina'
+					SUFFIX='qgki'
+					PLATFORM='yupik'
 					;;
 				*)
 					error 'device not supported'
 					;;
 			esac
 			;;
-		"--clean")
-			BUILD='clean'
-			;;
-		"--dtb_zip")
-			DTB_ZIP=1
+		"--dtb-zip")
+			dtb_zip
 			;&
 		"--dtbs")
-			OBJ=dtbs
-			dtb_zip
+			dtb_build
+			exit 0
 			;;
 		"--obj="*)
 			OBJ=${arg#*=}
 			obj_builder
 			;;
+		"--emod="*)
+			EMOD_PATH=${arg#*=}
+			if [ -z $EMOD_PATH ]; then
+				read -rp "PATH: " EMOD_PATH
+			fi
+			read -rp "MODNAME: " EMOD_NAME
+			read -rp "ROOT: " EMOD_ROOT
+			emod_builder
+			;;
 		"--regen")
-			GENERATE=1
 			config_regenerator
+			;;
+		*)
+			usage
 			;;
 	esac
 done
